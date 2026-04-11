@@ -342,15 +342,65 @@ tests/
 
 ## Scalability
 
-The current implementation uses O(n^2) pairwise comparison for spatial rules (overlap, clearance, zoning), which is optimal for the expected small dataset (~5 buildings).
+### Current Approach: Why O(n^2) Is the Right Choice Here
 
-For larger datasets:
+The clash detection rules (overlap, clearance, zoning) need to compare buildings against each other in pairs. With **n** buildings, there are **n(n-1)/2** unique pairs to check. This is O(n^2) complexity.
 
-| Scale | Approach |
-|-------|----------|
-| Up to ~50 buildings | Current implementation is sufficient |
-| 50-500 buildings | Pre-filter building types once; compare squared distances to avoid `Math.Sqrt` |
-| 500-5,000 buildings | Introduce spatial indexing (R-tree or grid-based spatial hash) |
-| 5,000+ buildings | Spatial index mandatory; consider sweep-line for overlap detection; parallelize rules |
+For the assessment's dataset of 5 buildings, that means:
+- **10 pairs** per pairwise rule (5 choose 2)
+- **3 pairwise rules** (overlap, clearance, zoning) = ~30 comparisons total
+- Executes in **microseconds**
 
-The Strategy pattern makes optimization straightforward -- each rule can be independently optimized or replaced without affecting others. The `GeometryHelper.GetPairs()` abstraction provides a single point to inject spatial indexing.
+At this scale, adding complexity (spatial indexes, acceleration structures) would hurt readability without measurable performance benefit. The brute-force approach is the most maintainable and correct choice.
+
+### What Happens as n Grows
+
+| n (buildings) | Pairs per rule | Total comparisons (3 rules) | Approximate time |
+|---------------|---------------|----------------------------|-----------------|
+| 5 | 10 | 30 | < 1ms |
+| 50 | 1,225 | 3,675 | < 10ms |
+| 500 | 124,750 | 374,250 | ~100ms |
+| 5,000 | 12,497,500 | 37,492,500 | ~10s |
+| 50,000 | 1,249,975,000 | 3.7 billion | minutes |
+
+The O(n^2) approach works well up to a few hundred buildings. Beyond that, the quadratic growth becomes the bottleneck.
+
+### Scaling Roadmap
+
+**Tier 1 (up to ~50 buildings): No changes needed**
+
+Current implementation is sufficient. The readability and maintainability advantages of the simple approach outweigh any performance concerns.
+
+**Tier 2 (50-500 buildings): Low-effort optimizations**
+
+- **Pre-filter building types once**: Instead of each zoning rule calling `.Where(b => b.Type == ...)` per evaluation, build a `Dictionary<BuildingType, List<Building>>` once in the handler and pass pre-grouped buildings to rules. Eliminates redundant filtering.
+- **Compare squared distances**: The `CalculateEdgeToEdgeDistance` method currently calls `Math.Sqrt(gapX^2 + gapY^2)`. Since we only compare against thresholds (`distance < 10`), we can compare `gapX^2 + gapY^2 < 100` instead -- avoiding the expensive square root for the majority of pairs that are not violations.
+
+**Tier 3 (500-5,000 buildings): Spatial indexing**
+
+Replace the brute-force pair iteration with a **spatial index** to avoid checking distant building pairs entirely:
+
+- **Grid-based spatial hash**: Divide the site plan into cells sized to the largest distance threshold (200 units for nightclub-school zoning). Each building maps to one or more cells. Pairwise checks only happen between buildings in the same cell or neighboring cells. Average complexity drops from O(n^2) to O(n * k) where k is the average number of nearby buildings per cell.
+- **R-tree**: A tree structure that groups nearby rectangles into hierarchical bounding boxes. Efficient for range queries ("find all buildings within 200 units of this nightclub"). Libraries like `RBush` provide ready-made implementations.
+
+The key insight: most building pairs are far apart and can be skipped entirely. A spatial index eliminates these irrelevant comparisons.
+
+**Tier 4 (5,000+ buildings): Advanced techniques**
+
+- **Sweep-line algorithm** for overlap detection: Sort buildings by X coordinate, sweep a vertical line left-to-right, and maintain an active set of buildings the line currently intersects. Only check overlaps between active buildings. Reduces overlap detection from O(n^2) to O(n log n).
+- **Parallel rule execution**: Since rules are pure functions with no shared state, run all 5 rules concurrently using `Task.WhenAll` or `Parallel.ForEach`. With spatial indexing, each rule's workload is already smaller, and parallelism provides an additional linear speedup.
+- **Streaming results**: Instead of collecting all clashes into a list, yield results as they're found using `IAsyncEnumerable<Clash>`. Reduces memory footprint for datasets with many violations.
+
+### Why the Architecture Supports This
+
+The **Strategy pattern** and **GeometryHelper abstraction** make these optimizations straightforward:
+
+1. **`IClashDetectionRule` interface**: Each rule can be independently optimized or replaced. Upgrading `ClearanceRule` to use spatial indexing doesn't require touching `OverlapRule` or any other rule.
+
+2. **`GeometryHelper.GetPairs()`**: All pairwise rules call this single method to iterate building pairs. Replacing the brute-force nested loop with a spatial-index-backed pair generator is a **one-line change** -- all rules automatically benefit.
+
+3. **`GeometryHelper.CalculateEdgeToEdgeDistance()`**: The distance formula is centralized. Switching to squared-distance comparison is a single method change that benefits all rules using distance thresholds.
+
+4. **DI-registered rules**: Rules are discovered via assembly scanning and injected as `IEnumerable<IClashDetectionRule>`. The handler doesn't know or care how many rules exist or how they work internally. Adding a spatially-optimized rule variant is transparent.
+
+This means the solution can scale from 5 to 50,000 buildings through **incremental, isolated changes** -- no architectural rewrites needed.
