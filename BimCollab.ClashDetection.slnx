@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BimCollab.ClashDetection.Api/BimCollab.ClashDetection.Api.csproj" />
+    <Project Path="src/BimCollab.ClashDetection.AppHost/BimCollab.ClashDetection.AppHost.csproj" />
+    <Project Path="src/BimCollab.ClashDetection.Application/BimCollab.ClashDetection.Application.csproj" />
+    <Project Path="src/BimCollab.ClashDetection.Domain/BimCollab.ClashDetection.Domain.csproj" />
+    <Project Path="src/BimCollab.ClashDetection.ServiceDefaults/BimCollab.ClashDetection.ServiceDefaults.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BimCollab.ClashDetection.Api.Tests/BimCollab.ClashDetection.Api.Tests.csproj" />
+    <Project Path="tests/BimCollab.ClashDetection.Application.Tests/BimCollab.ClashDetection.Application.Tests.csproj" />
+    <Project Path="tests/BimCollab.ClashDetection.Domain.Tests/BimCollab.ClashDetection.Domain.Tests.csproj" />
+    <Project Path="tests/BimCollab.ClashDetection.Specs/BimCollab.ClashDetection.Specs.csproj" />
+  </Folder>
+</Solution>
