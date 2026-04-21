@@ -1,406 +1,261 @@
-# BimCollab Clash Detection API
+# BIM Clash Detection API
+
+Tech screening for BIMcollab. The API takes a site plan and a list of
+buildings, runs validation and five rules, and returns the clashes.
+
+Run: `dotnet run --project src/BimCollab.ClashDetection.Api`, then open
+http://localhost:5201/scalar/v1.
+Tests: `dotnet test` (104 tests).
+
+Below is what the reviewer asked for: my approach, the key decisions,
+the trade-offs, and what I'd change for production.
+
+
+## How I worked on this
+
+I used **spec-driven development with BDD**. Specs first, code second.
+That's my default way of working as an architect, and I kept it here.
+
+**1. Read the brief and asked questions before any code.**
+I sent the reviewer three questions up front (see
+`follow-up-questions.md`): how big can the dataset be, are the rules
+fixed or configurable, and what output format is expected. The answers
+shaped everything. Small dataset means brute force is fine. Fixed rules
+with extensibility valued means Strategy pattern is worth the
+structure. JSON output means clean DTOs.
+
+**2. Listed the rules on paper.**
+Validation, boundary, overlap, clearance, two zoning rules. After
+validation, every rule has the same shape: take a site plan and
+buildings, return clashes. That's where the Strategy pattern came from.
+Validation is different because it returns errors, so it goes before
+the rules, not inside them.
+
+**3. Wrote the specs as Reqnroll (Gherkin) feature files.**
+Happy paths, edge cases (touching edges, distance exactly at the
+threshold, empty list, single building), validation cases. All written
+before any production code. The feature files in
+`tests/.../Specs/Features` are the contract.
+
+**4. Designed the architecture on paper.**
+Clean Architecture, Domain with zero dependencies, Application with
+CQRS via MediatR, one POST endpoint in a Minimal API.
+
+**5. Brainstormed with AI, then had it implement.**
+I walked through the layers with AI, corrected anything that didn't
+match my design, then had AI generate the scaffolding. I wrote the
+parts I wanted to own myself: the geometry math and the rule merging
+in the handler.
+
+**6. Ran the specs.**
+If something failed, I fixed the code, not the spec.
+
+AI did a lot of the typing. The specs, the architecture, and the
+trade-offs are mine.
+
+
+## Key decisions
+
+**Clean Architecture.**
+Domain depends on nothing. Application depends on Domain. API depends
+on Application. It's more structure than 5 buildings need, but the
+brief asks about extensibility. If the transport changes (HTTP to a
+queue consumer), the rules don't move.
+
+**Strategy pattern for the rules.**
+Each rule implements `IClashDetectionRule`. DI picks them up by
+assembly scanning. Adding a rule is one new class, nothing else
+changes. This is the piece I care about most, because "what if another
+rule shows up" is the main question the brief is testing.
+
+**CQRS with MediatR.**
+One command today, so MediatR is more than I strictly need. I kept it
+because the pipeline behaviour for validation is cleaner than any
+alternative, and future queries come free.
+
+**BDD with Reqnroll.**
+The brief already reads like Gherkin. Feature files mean a
+non-developer can check "did he build what we asked?" without reading
+C#. It also forced me to write the edge cases upfront.
+
+**FluentValidation in a pipeline, not inside the handler.**
+`ValidationBehavior<TRequest, TResponse>` runs FluentValidation before
+every handler automatically. Field checks, enum checks (case-sensitive),
+unique names, max 500 buildings. If anything fails, the whole request
+is rejected before any rule runs. No half-valid responses.
+
+**Overlap hides clearance, handled outside the rules.**
+Two buildings that overlap are also closer than 10 units, so both
+rules fire. I suppress the clearance clash in the handler after all
+rules have run. I kept this out of `ClearanceRule` on purpose. Rules
+shouldn't know about each other.
+
+**.NET 10, Minimal API, Scalar, Aspire.**
+Newest .NET on purpose. Minimal API because controllers are heavy for
+one endpoint. Scalar for cleaner docs. Aspire gives me OpenTelemetry,
+health checks, and a dashboard without wiring anything. Not required
+by the brief. It's the observability baseline I'd bring to any real
+service.
+
+
+## Trade-offs I considered
+
+**One project vs. Clean Architecture.**
+One project with a few files would ship in 30 minutes. Clean
+Architecture wins because the brief is about extensibility.
 
-A proof-of-concept BIM clash detection API that validates building placements on construction site plans and detects regulatory, spatial, and zoning violations.
+**Plain service class vs. MediatR.**
+A simple `Detect(request)` method works and needs no library. MediatR
+wins because the validation pipeline is cleaner and future queries are
+free.
 
-Built for the [BIMcollab Tech Screening Assessment v1.1](bimcollab-techscreening-v1.1_1.pdf).
+**DataAnnotations vs. FluentValidation.**
+DataAnnotations are fine for simple fields. They break on "names must
+be unique" and "type is one of five, case-sensitive". FluentValidation
+handles all of it in one class.
 
-## Table of Contents
+**Reqnroll vs. xUnit only.**
+Reqnroll adds a project and a build step. Pure xUnit with theory data
+covers the same ground. I kept Reqnroll because the brief already
+reads like scenarios and feature files are readable by non-developers.
 
-- [Overview](#overview)
-- [Tech Stack](#tech-stack)
-- [Architecture](#architecture)
-- [Getting Started](#getting-started)
-- [Running the API](#running-the-api)
-- [Running Tests](#running-tests)
-- [API Reference](#api-reference)
-- [Business Rules](#business-rules)
-- [Design Decisions](#design-decisions)
-- [Project Structure](#project-structure)
-- [Scalability](#scalability)
+**Inline rules vs. Strategy pattern.**
+A 60-line method with 5 `if` blocks is shorter to read. Strategy wins
+because each rule is independently testable and adding one is a
+one-file change.
 
-## Overview
+**O(n²) brute force vs. spatial index.**
+Brute force for 5 buildings is microseconds. A spatial index costs
+readability. I picked brute force and documented the scaling path
+below. `GeometryHelper.GetPairs` is the one place that changes later
+if we ever need to switch.
 
-The API accepts a site plan with proposed buildings and detects all clashes (violations) based on validation rules, spatial constraints, and zoning regulations. Each clash includes the involved buildings, violation type, severity level, and a human-readable description.
 
-**Key capabilities:**
-- Input validation with structured error responses (RFC 9457)
-- Boundary violation detection (buildings outside site plan)
-- Building overlap detection
-- Minimum clearance enforcement (10 units between buildings)
-- Zoning compliance (nightclub-school and residential-stadium/nightclub distance rules)
-- Severity classification (Critical vs Warning)
+## Shortcuts (what I'd do differently for production)
 
-## Tech Stack
+I already asked three questions before writing any code. For a
+production version I'd ask a lot more, because "production" isn't one
+thing. An internal tool and a public API need very different
+architectures.
 
-| Technology | Version | Purpose |
-|-----------|---------|---------|
-| .NET | 10.0 | Runtime & SDK |
-| ASP.NET Core | Minimal API | Web framework |
-| .NET Aspire | 13.2.2 | Orchestration, OpenTelemetry, health checks |
-| MediatR | 14.1 | CQRS command/query dispatch |
-| FluentValidation | 12.1 | Declarative input validation |
-| Scalar | 2.13 | Interactive API documentation |
-| xUnit | - | Unit & integration testing |
-| Reqnroll | 3.3 | BDD testing (Gherkin scenarios) |
-
-## Architecture
-
-The solution follows **Clean Architecture (Onion Architecture)** with **CQRS** via MediatR:
+### Questions I'd ask first
 
-```
-                    +------------------+
-                    |      API         |  Endpoints, Contracts, Middleware
-                    +--------+---------+
-                             |
-                    +--------+---------+
-                    |   Application    |  Commands, Handlers, Validators, Behaviors
-                    +--------+---------+
-                             |
-                    +--------+---------+
-                    |     Domain       |  Entities, Rules, Value Objects, Enums
-                    +------------------+
-```
+**Business and product.** Standalone service, or embedded in a bigger
+product? Who's the actual end user, and what does success look like for
+them? What's on the roadmap: new rule types, customer-specific rules,
+AI-assisted detection?
 
-**Dependencies flow inward only.** The Domain layer has zero external dependencies.
+**Consumers and integration.** Who calls this: client apps, a UI, or
+other backend services? Sync (user waits) or async (batch job)?
+Realistic payload size today, and in two years?
 
-### Key Patterns
+**Scale.** Expected load and peak? Latency targets? Single region or
+global? Any data-residency constraints?
 
-- **Strategy Pattern** for clash detection rules (`IClashDetectionRule`): each rule is an independent, testable class. Adding a new rule requires zero changes to existing code.
-- **MediatR Pipeline Behaviors**: validation runs as a cross-cutting concern before the handler executes.
-- **BDD-First Development**: Reqnroll feature files define acceptance criteria; implementation makes them pass.
+**Security.** Is the geometry data sensitive? Tenant model: single,
+per-customer keys, or SSO? Audit trail? Any compliance standards
+(GDPR, ISO 27001, SOC 2)?
 
-## Getting Started
+**Cost and operations.** Budget per request or per tenant? Who operates
+this at 3am? Preferred cloud, or existing infrastructure we need to
+fit into?
 
-### Prerequisites
-
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+### How the answers change the tech
 
-### Build
+**Auth.** Internal behind a VPN: Entra ID, one app, done. Public API
+with third-party consumers: OAuth per customer, tenant isolation in
+every handler, audit logs.
 
-```bash
-dotnet build
-```
+**Thresholds.** The 10, 150, 200 are `const double` in the rules. Fine
+if the rule is global. For per-region variants, move them to
+`IOptions<ZoningOptions>` from config. For customer-authored rules,
+that becomes a separate service with a UI.
 
-### Verify
+**Persistence.** API is stateless today. If clash reports are used
+later (disputes, task tracking, analytics), I'd store request and
+result per tenant in Postgres.
 
-```bash
-dotnet test
-```
+**Sync vs async.** Request/response works for small plans. For a
+5,000-building masterplan, HTTP times out before the algorithm
+finishes. Past some size I'd return `202 Accepted` with a job id, run
+detection with a spatial index, and deliver via webhook or polling.
 
-## Running the API
+**Rate limiting.** Internal: not needed. Public: depends on pricing.
+Flat per-seat gets an RPM cap in the gateway. Metered pricing needs
+rate limiting and usage counting in Redis, not in-memory.
 
-### Standalone (recommended for quick testing)
+**Observability.** Aspire dashboard is fine on my laptop. Production
+exports to Application Insights or similar. Multi-tenant: tenant id on
+every trace so "slow for customer X" is a filter, not an
+investigation.
 
-```bash
-dotnet run --project src/BimCollab.ClashDetection.Api
-```
-
-The API starts at **http://localhost:5201**
-
-| URL | Description |
-|-----|-------------|
-| http://localhost:5201/scalar/v1 | Interactive API documentation |
-| http://localhost:5201/health | Health check |
-| http://localhost:5201/alive | Liveness probe |
-| http://localhost:5201/openapi/v1.json | OpenAPI specification |
-
-### With Aspire Dashboard (telemetry, logs, traces)
-
-```bash
-dotnet run --project src/BimCollab.ClashDetection.AppHost --launch-profile http
-```
-
-The Aspire Dashboard URL (with login token) will be printed in the console output.
-
-### Quick Test with curl
-
-**Detect clashes (assessment example dataset):**
-
-```bash
-curl -X POST http://localhost:5201/api/clash-detection/detect \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sitePlan": { "width": 1000, "length": 500 },
-    "buildings": [
-      { "name": "Oakwood Academy", "type": "School", "width": 300, "length": 300, "x": 0, "y": 0 },
-      { "name": "Pulse", "type": "Nightclub", "width": 200, "length": 200, "x": 0, "y": 500 },
-      { "name": "Centennial Park", "type": "Stadium", "width": 700, "length": 300, "x": 400, "y": 300 },
-      { "name": "Willow Residence", "type": "ResidentialBuilding", "width": 200, "length": 200, "x": 300, "y": 100 },
-      { "name": "Maple Plaza", "type": "Office", "width": 150, "length": 150, "x": 250, "y": 150 }
-    ]
-  }'
-```
-
-**Trigger validation errors:**
-
-```bash
-curl -X POST http://localhost:5201/api/clash-detection/detect \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sitePlan": { "width": 1000, "length": 500 },
-    "buildings": [
-      { "name": "", "type": "InvalidType", "width": 0, "length": -1, "x": -5, "y": 0 }
-    ]
-  }'
-```
-
-## Running Tests
-
-```bash
-# All tests (104 total)
-dotnet test
-
-# Domain rule tests only
-dotnet test --filter "FullyQualifiedName~Domain.Tests"
-
-# Application tests (handler + validator)
-dotnet test --filter "FullyQualifiedName~Application.Tests"
-
-# API integration tests
-dotnet test --filter "FullyQualifiedName~Api.Tests"
-
-# BDD scenarios only
-dotnet test --filter "FullyQualifiedName~Specs"
-```
-
-### Test Distribution
-
-| Project | Tests | Coverage |
-|---------|-------|----------|
-| Domain.Tests | 32 | All 5 detection rules + boundary conditions + diagonal distances + combinatorial cases |
-| Application.Tests | 36 | Command handler (mapping, aggregation, overlap-subsumes-clearance) + validator (all rules, case sensitivity, building count limit) |
-| Api.Tests | 11 | Integration tests via WebApplicationFactory (happy path, validation errors, malformed JSON) |
-| Specs (BDD) | 25 | 9 clash detection scenarios + 6 edge cases + 10 validation scenarios |
-| **Total** | **104** | |
-
-## API Reference
-
-### `POST /api/clash-detection/detect`
-
-Accepts a site plan with buildings, validates input, runs all clash detection rules, and returns detected violations.
-
-#### Request Body
-
-```json
-{
-  "sitePlan": {
-    "width": 1000,
-    "length": 500
-  },
-  "buildings": [
-    {
-      "name": "Building A",
-      "type": "School",
-      "width": 100,
-      "length": 100,
-      "x": 0,
-      "y": 0
-    }
-  ]
-}
-```
-
-| Field | Type | Required | Constraints |
-|-------|------|----------|-------------|
-| `sitePlan.width` | number | Yes | > 0 |
-| `sitePlan.length` | number | Yes | > 0 |
-| `buildings[].name` | string | Yes | Non-empty, unique within request |
-| `buildings[].type` | string | Yes | `School`, `Nightclub`, `Stadium`, `ResidentialBuilding`, or `Office` |
-| `buildings[].width` | number | Yes | > 0 |
-| `buildings[].length` | number | Yes | > 0 |
-| `buildings[].x` | number | Yes | >= 0 |
-| `buildings[].y` | number | Yes | >= 0 |
-
-Building types are **case-sensitive**. Maximum **500 buildings** per request.
-
-#### Success Response (HTTP 200)
-
-```json
-{
-  "clashes": [
-    {
-      "buildingNames": ["Pulse"],
-      "type": "BoundaryViolation",
-      "severity": "Critical",
-      "description": "Building 'Pulse' extends beyond site plan boundaries."
-    },
-    {
-      "buildingNames": ["Oakwood Academy", "Maple Plaza"],
-      "type": "Overlap",
-      "severity": "Critical",
-      "description": "Buildings 'Oakwood Academy' and 'Maple Plaza' overlap."
-    }
-  ]
-}
-```
-
-#### Clash Types and Severity
-
-| Type | Severity | Description |
-|------|----------|-------------|
-| `BoundaryViolation` | `Critical` | Building extends beyond site plan boundaries |
-| `Overlap` | `Critical` | Two buildings share interior space |
-| `InsufficientClearance` | `Warning` | Buildings are closer than 10 units (edge-to-edge) |
-| `ZoningViolation` | `Warning` | Zoning distance requirement not met |
-
-#### Validation Error Response (HTTP 400)
-
-Follows [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) Problem Details format:
-
-```json
-{
-  "type": "https://tools.ietf.org/html/rfc9457",
-  "title": "One or more validation errors occurred.",
-  "status": 400,
-  "errors": {
-    "Buildings[0].Name": ["Building Name must not be empty."],
-    "Buildings[0].Width": ["Building Width must be greater than 0."]
-  }
-}
-```
-
-If **any** building fails validation, the entire request is rejected. No clash detection runs.
-
-## Business Rules
-
-### Validation Rules
-
-- All building attributes (name, type, width, length, x, y) must be provided
-- Building dimensions (width, length) must be positive numbers (> 0)
-- Building positions (x, y) must be non-negative (>= 0)
-- Building names must be unique within a request
-- Building type must be one of the five known types (case-sensitive)
-- Site plan dimensions must be positive (> 0)
-
-### General Rules
-
-- **Boundary**: Buildings must be fully within the site plan. A building at (x, y) with dimensions (width, length) occupies `[x, x+width] x [y, y+length]`. The site plan occupies `[0, width] x [0, length]`.
-- **Overlap**: Buildings cannot share interior space. Touching edges (distance = 0) is **not** overlap.
-- **Clearance**: Each building must maintain a minimum 10-unit edge-to-edge distance from other buildings.
-
-### Zoning Rules
-
-- **Nightclubs** must be at least **200 units** (edge-to-edge) from any **school**
-- **Residential buildings** must be at least **150 units** (edge-to-edge) from any **stadium** or **nightclub**
-
-### Rule Interaction
-
-- **Overlap subsumes clearance**: If two buildings overlap, only the Overlap clash is reported -- the redundant InsufficientClearance clash for that pair is suppressed.
-- A building pair can trigger multiple independent violations (e.g., Overlap + ZoningViolation).
-- Distance is measured as the minimum **Euclidean edge-to-edge distance** between axis-aligned rectangles.
-- Threshold comparisons use strict inequality: distance >= N means the rule is satisfied; distance < N is a violation.
-
-## Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| **Clean Architecture** | Enforces separation of concerns. Domain has zero dependencies. Each layer is independently testable. |
-| **CQRS via MediatR** | Clean command/handler separation. Pipeline behaviors enable cross-cutting validation without polluting business logic. |
-| **Strategy Pattern for rules** | Each rule implements `IClashDetectionRule`. New rules are auto-discovered via assembly scanning -- zero configuration needed. Follows Open/Closed Principle. |
-| **No Event Sourcing** | The operation is stateless (input in, clashes out). No state to track over time. |
-| **No database** | Computation is pure and ephemeral. Each request is independent. |
-| **FluentValidation pipeline** | Validation fires before the handler via `ValidationBehavior<TRequest, TResponse>`. Invalid requests never reach business logic. |
-| **Overlap subsumes clearance** | Applied in the handler as post-processing, not in individual rules. Keeps rules independent and unaware of each other. |
-| **Singleton rules** | Rules are stateless (no mutable fields). Singleton registration avoids per-request allocations. |
-| **GeometryHelper utility** | Shared distance calculation and pair iteration extracted to avoid coupling between rules. |
-| **RFC 9457 error responses** | Industry standard for API error reporting. Handles both validation errors and malformed JSON. |
-| **BDD-first development** | Reqnroll feature files written before implementation. Ensures requirements coverage and enables regression testing. |
-
-## Project Structure
+**API versioning.** URL-based (`/v1/clashes`) before a second
+consumer. Deprecation headers with sunset dates. And agreement with
+product on what "breaking" means, because renaming an enum breaks a
+strongly-typed C# client even if the JSON still parses.
+
+**Errors.** English only today. If errors end up in a user-facing
+tool, they need localisation, with stable error codes separated from
+the human-readable messages.
+
+**Benchmarks.** Add a BenchmarkDotNet project with p99 latency gates in
+CI. Plus JSON contract tests, so enum renames don't silently break
+consumers.
+
+
+## Project layout
 
 ```
 src/
-  BimCollab.ClashDetection.Domain/           # Entities, Value Objects, Enums, Rules (zero dependencies)
-    Entities/                                # Building, SitePlan
-    ValueObjects/                            # Position, Dimensions
-    Enums/                                   # BuildingType, ClashType, ClashSeverity
-    Models/                                  # Clash
-    Rules/                                   # IClashDetectionRule + 5 implementations
-    Utilities/                               # GeometryHelper (shared distance calculation)
-
-  BimCollab.ClashDetection.Application/      # CQRS commands, handlers, validators (depends on Domain)
-    ClashDetection/Commands/                 # DetectClashesCommand + Handler
-    ClashDetection/Validators/               # FluentValidation rules
-    Common/Behaviors/                        # MediatR pipeline (ValidationBehavior)
-
-  BimCollab.ClashDetection.Api/              # Minimal API endpoints (depends on Application)
-    Endpoints/                               # POST /api/clash-detection/detect
-    Contracts/                               # Request/Response DTOs
-    Middleware/                              # ValidationExceptionHandler (RFC 9457)
-
-  BimCollab.ClashDetection.AppHost/          # .NET Aspire orchestrator
-  BimCollab.ClashDetection.ServiceDefaults/  # OpenTelemetry, health checks, resilience
+  Domain/          Entities, rules, geometry. Zero dependencies.
+  Application/     CQRS command, handler, validator, MediatR pipeline.
+  Api/             Minimal API, problem-details middleware, Scalar.
+  AppHost/         Aspire orchestrator.
+  ServiceDefaults/ OpenTelemetry, health checks.
 
 tests/
-  BimCollab.ClashDetection.Domain.Tests/     # Unit tests for all 5 rules
-  BimCollab.ClashDetection.Application.Tests/# Handler + validator tests
-  BimCollab.ClashDetection.Api.Tests/        # Integration tests (WebApplicationFactory)
-  BimCollab.ClashDetection.Specs/            # BDD scenarios (Reqnroll/Gherkin)
-    Features/                                # ClashDetection, EdgeCases, InputValidation
-    StepDefinitions/                         # HTTP-based step implementations
+  Domain.Tests/        32 tests, one per rule.
+  Application.Tests/   36 tests, handler + validator.
+  Api.Tests/           11 tests, integration via WebApplicationFactory.
+  Specs/               25 Reqnroll scenarios.
 ```
 
-## Scalability
+Total: 104 tests.
 
-### Current Approach: Why O(n^2) Is the Right Choice Here
 
-The clash detection rules (overlap, clearance, zoning) need to compare buildings against each other in pairs. With **n** buildings, there are **n(n-1)/2** unique pairs to check. This is O(n^2) complexity.
+## Business rules (from the brief)
 
-For the assessment's dataset of 5 buildings, that means:
-- **10 pairs** per pairwise rule (5 choose 2)
-- **3 pairwise rules** (overlap, clearance, zoning) = ~30 comparisons total
-- Executes in **microseconds**
+- Validation: all fields required, width/length > 0, x/y ≥ 0, unique
+  names, max 500 buildings.
+- Boundary: buildings fit fully inside the site plan.
+- Overlap: no shared interior. Touching edges is not overlap.
+- Clearance: ≥ 10 units edge-to-edge between any two buildings.
+- Nightclub vs School: ≥ 200 units apart.
+- Residential vs Stadium or Nightclub: ≥ 150 units apart.
 
-At this scale, adding complexity (spatial indexes, acceleration structures) would hurt readability without measurable performance benefit. The brute-force approach is the most maintainable and correct choice.
+If two buildings overlap, only the overlap is reported for that pair.
 
-### What Happens as n Grows
 
-| n (buildings) | Pairs per rule | Total comparisons (3 rules) | Approximate time |
-|---------------|---------------|----------------------------|-----------------|
-| 5 | 10 | 30 | < 1ms |
-| 50 | 1,225 | 3,675 | < 10ms |
-| 500 | 124,750 | 374,250 | ~100ms |
-| 5,000 | 12,497,500 | 37,492,500 | ~10s |
-| 50,000 | 1,249,975,000 | 3.7 billion | minutes |
+## Scaling past 5 buildings
 
-The O(n^2) approach works well up to a few hundred buildings. Beyond that, the quadratic growth becomes the bottleneck.
+The 3 pairwise rules are O(n²).
 
-### Scaling Roadmap
+- 5 buildings: 10 pairs, microseconds.
+- 500 buildings: ~125k pairs, ~100ms.
+- 5,000 buildings: ~12M pairs, ~10 seconds.
 
-**Tier 1 (up to ~50 buildings): No changes needed**
+Path if it ever matters:
 
-Current implementation is sufficient. The readability and maintainability advantages of the simple approach outweigh any performance concerns.
+- Up to ~50: no change needed.
+- 50 to 500: pre-group by type once, compare squared distances (skip
+  the `Math.Sqrt`).
+- 500 to 5,000: swap `GeometryHelper.GetPairs` from a nested loop to a
+  spatial index (grid hash or R-tree via RBush). One-line change.
+- 5,000+: sweep-line for overlap detection (O(n log n)), parallel rule
+  execution via `Task.WhenAll`, stream results with
+  `IAsyncEnumerable<Clash>` if memory matters.
 
-**Tier 2 (50-500 buildings): Low-effort optimizations**
-
-- **Pre-filter building types once**: Instead of each zoning rule calling `.Where(b => b.Type == ...)` per evaluation, build a `Dictionary<BuildingType, List<Building>>` once in the handler and pass pre-grouped buildings to rules. Eliminates redundant filtering.
-- **Compare squared distances**: The `CalculateEdgeToEdgeDistance` method currently calls `Math.Sqrt(gapX^2 + gapY^2)`. Since we only compare against thresholds (`distance < 10`), we can compare `gapX^2 + gapY^2 < 100` instead -- avoiding the expensive square root for the majority of pairs that are not violations.
-
-**Tier 3 (500-5,000 buildings): Spatial indexing**
-
-Replace the brute-force pair iteration with a **spatial index** to avoid checking distant building pairs entirely:
-
-- **Grid-based spatial hash**: Divide the site plan into cells sized to the largest distance threshold (200 units for nightclub-school zoning). Each building maps to one or more cells. Pairwise checks only happen between buildings in the same cell or neighboring cells. Average complexity drops from O(n^2) to O(n * k) where k is the average number of nearby buildings per cell.
-- **R-tree**: A tree structure that groups nearby rectangles into hierarchical bounding boxes. Efficient for range queries ("find all buildings within 200 units of this nightclub"). Libraries like `RBush` provide ready-made implementations.
-
-The key insight: most building pairs are far apart and can be skipped entirely. A spatial index eliminates these irrelevant comparisons.
-
-**Tier 4 (5,000+ buildings): Advanced techniques**
-
-- **Sweep-line algorithm** for overlap detection: Sort buildings by X coordinate, sweep a vertical line left-to-right, and maintain an active set of buildings the line currently intersects. Only check overlaps between active buildings. Reduces overlap detection from O(n^2) to O(n log n).
-- **Parallel rule execution**: Since rules are pure functions with no shared state, run all 5 rules concurrently using `Task.WhenAll` or `Parallel.ForEach`. With spatial indexing, each rule's workload is already smaller, and parallelism provides an additional linear speedup.
-- **Streaming results**: Instead of collecting all clashes into a list, yield results as they're found using `IAsyncEnumerable<Clash>`. Reduces memory footprint for datasets with many violations.
-
-### Why the Architecture Supports This
-
-The **Strategy pattern** and **GeometryHelper abstraction** make these optimizations straightforward:
-
-1. **`IClashDetectionRule` interface**: Each rule can be independently optimized or replaced. Upgrading `ClearanceRule` to use spatial indexing doesn't require touching `OverlapRule` or any other rule.
-
-2. **`GeometryHelper.GetPairs()`**: All pairwise rules call this single method to iterate building pairs. Replacing the brute-force nested loop with a spatial-index-backed pair generator is a **one-line change** -- all rules automatically benefit.
-
-3. **`GeometryHelper.CalculateEdgeToEdgeDistance()`**: The distance formula is centralized. Switching to squared-distance comparison is a single method change that benefits all rules using distance thresholds.
-
-4. **DI-registered rules**: Rules are discovered via assembly scanning and injected as `IEnumerable<IClashDetectionRule>`. The handler doesn't know or care how many rules exist or how they work internally. Adding a spatially-optimized rule variant is transparent.
-
-This means the solution can scale from 5 to 50,000 buildings through **incremental, isolated changes** -- no architectural rewrites needed.
+This works because `GeometryHelper.GetPairs` is the single place every
+pairwise rule iterates pairs, and `CalculateEdgeToEdgeDistance` is the
+single place the distance math lives. Swap either, every rule
+benefits.
